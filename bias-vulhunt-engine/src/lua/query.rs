@@ -400,7 +400,7 @@ pub type CallsFromQuery = CallsQuery;
 #[derive(Debug, Clone, PartialEq, Eq, Ord, PartialOrd, Hash, Deserialize)]
 pub struct CallSiteCallOpts {
     #[serde(flatten)]
-    pub(crate) address: AddressTarget,
+    pub(crate) target: AddressTarget,
     #[serde(default)]
     pub(crate) jumps_as_calls: bool,
 }
@@ -414,13 +414,13 @@ pub enum CallSiteQuery {
 }
 
 impl CallSiteQuery {
-    pub fn targets(self) -> (Address, bool) {
+    pub fn target(self) -> (Address, bool) {
         match self {
             Self::Address(addr) => (addr, false),
             Self::WithOptions(CallSiteCallOpts {
-                address,
+                target,
                 jumps_as_calls,
-            }) => (*address, jumps_as_calls),
+            }) => (*target, jumps_as_calls),
         }
     }
 }

@@ -719,6 +719,9 @@ where
             },
         );
 
+        // SAFETY: this is safe iff the VM will not outlive the data borrowed from the project
+        // handle, which is guaranteed in VulHunt's current architecture, however, care must be
+        // taken to ensure this guarantee is upheld if the API is used in other contexts.
         methods.add_method(
             "callees_matching",
             |lua, this, cond: Table| -> Result<Value, Error> {
@@ -865,6 +868,9 @@ where
             },
         );
 
+        // SAFETY: this is safe iff the VM will not outlive the data borrowed from the project
+        // handle, which is guaranteed in VulHunt's current architecture, however, care must be
+        // taken to ensure this guarantee is upheld if the API is used in other contexts.
         methods.add_method(
             "callee_at",
             |lua, this, cond: Table| -> Result<Value, Error> {
@@ -887,7 +893,7 @@ where
                     return Err(Error::runtime("debug invalid; expected a boolean"));
                 };
 
-                let (addr, with_jumps) = target.targets();
+                let (addr, with_jumps) = target.target();
 
                 let functions = this.project.functions();
                 let blocks = this.project.code_blocks();

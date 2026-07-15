@@ -2071,6 +2071,9 @@ impl<'a> UserData for DecompiledFunction<'a> {
             Ok(this.decompilation.source().to_owned())
         });
 
+        // SAFETY: this is safe iff the VM will not outlive the data borrowed from the project
+        // handle, which is guaranteed in VulHunt's current architecture, however, care must be
+        // taken to ensure this guarantee is upheld if the API is used in other contexts.
         methods.add_method("query", |lua, this, query: Value| {
             // case 1: value is a string; use syntax engine
             if let Some(query) = query.as_string().and_then(|s| s.to_str().ok()) {
