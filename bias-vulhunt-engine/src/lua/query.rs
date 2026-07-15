@@ -328,14 +328,14 @@ impl FunctionQuery {
 #[derive(Debug, Clone, PartialEq, Eq, Ord, PartialOrd, Hash, Deserialize)]
 pub struct FunctionQueryCallOpts {
     #[serde(flatten)]
-    pub(crate) to: FunctionQueryTarget,
+    pub(crate) target: FunctionQueryTarget,
     #[serde(default)]
     pub(crate) jumps_as_calls: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Ord, PartialOrd, Hash, Deserialize)]
 #[serde(untagged)]
-pub enum CallsToQuery {
+pub enum CallsQuery {
     #[serde(with = "::serde_with::As::<::serde_with::FromInto::<AddressValue>>")]
     Address(Address),
     Symbol(String),
@@ -343,7 +343,7 @@ pub enum CallsToQuery {
     WithOptions(FunctionQueryCallOpts),
 }
 
-impl CallsToQuery {
+impl CallsQuery {
     pub fn targets<'a>(
         &self,
         project: &'a Project,
@@ -378,15 +378,49 @@ impl CallsToQuery {
                 (targets, false)
             }
             Self::Fuzzy(fuzzy) => (fuzzy.targets(project, symbols)?, false),
-            Self::WithOptions(FunctionQueryCallOpts { to, jumps_as_calls }) => {
+            Self::WithOptions(FunctionQueryCallOpts {
+                target,
+                jumps_as_calls,
+            }) => {
                 let targets = if imp {
-                    to.targets_with(project, symbols, true)?
+                    target.targets_with(project, symbols, true)?
                 } else {
-                    to.targets(project, symbols)?
+                    target.targets(project, symbols)?
                 };
 
                 (targets, *jumps_as_calls)
             }
         })
+    }
+}
+
+pub type CallsToQuery = CallsQuery;
+pub type CallsFromQuery = CallsQuery;
+
+#[derive(Debug, Clone, PartialEq, Eq, Ord, PartialOrd, Hash, Deserialize)]
+pub struct CallSiteCallOpts {
+    #[serde(flatten)]
+    pub(crate) address: AddressTarget,
+    #[serde(default)]
+    pub(crate) jumps_as_calls: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Ord, PartialOrd, Hash, Deserialize)]
+#[serde(untagged)]
+pub enum CallSiteQuery {
+    #[serde(with = "::serde_with::As::<::serde_with::FromInto::<AddressValue>>")]
+    Address(Address),
+    WithOptions(CallSiteCallOpts),
+}
+
+impl CallSiteQuery {
+    pub fn targets(self) -> (Address, bool) {
+        match self {
+            Self::Address(addr) => (addr, false),
+            Self::WithOptions(CallSiteCallOpts {
+                address,
+                jumps_as_calls,
+            }) => (*address, jumps_as_calls),
+        }
     }
 }

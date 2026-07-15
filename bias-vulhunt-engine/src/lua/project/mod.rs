@@ -5,6 +5,7 @@ use std::mem;
 use std::str::FromStr;
 use std::sync::Arc;
 
+use bias_core::analyses::blocks::CodeBlockBounds;
 use bias_core::analyses::strings::StringsXRefDB;
 use bias_core::prelude::*;
 
@@ -29,12 +30,11 @@ use parking_lot::Mutex;
 use crate::analysis::DECOMPILER_TIMEOUT;
 use crate::lua::scope::{AnnotatingPlatformTypeResolver, CheckScopeCallsAnnotations};
 use crate::lua::types::{IRTerm, IRVar};
-use crate::lua::{CallsToQuery, FunctionQuery};
+use crate::lua::{CallSiteQuery, CallsFromQuery, CallsToQuery, FunctionQuery};
 
 use super::api::{AddressValue, DecompiledFunction};
 use super::scope::CheckScopeProjectData;
-use super::CallSiteContext;
-use super::{CheckerArch, CheckerError, FunctionContext};
+use super::{CallSiteContext, CheckerArch, CheckerError, FunctionContext};
 
 pub mod decompiler;
 pub use decompiler::{DynamicDecompilerContext, DynamicResolver};
@@ -720,6 +720,271 @@ where
         );
 
         methods.add_method(
+            "callees_matching",
+            |lua, this, cond: Table| -> Result<Value, Error> {
+                // from -> CallsFromQuery
+                // where -> function (optional)
+                // using -> annotations (optional)
+                // debug -> produce debug string (optional)
+
+                let Ok(from) = cond
+                    .get::<Value>("from")
+                    .and_then(|value| lua.from_value::<CallsFromQuery>(value))
+                else {
+                    return Err(Error::runtime(
+                        "from missing or invalid; expected symbol name or address",
+                    ));
+                };
+
+                let Ok(where_) = cond.get::<Option<mlua::Function>>("where") else {
+                    return Err(Error::runtime("where invalid; expected a function"));
+                };
+
+                let Ok(using) = cond
+                    .get::<Value>("using")
+                    .and_then(|value| lua.from_value::<Option<CheckScopeCallsAnnotations>>(value))
+                else {
+                    return Err(Error::runtime(
+                        "using invalid; expected a table of specifications",
+                    ));
+                };
+
+                let Ok(debug) = cond
+                    .get::<Option<bool>>("debug")
+                    .map(Option::unwrap_or_default)
+                else {
+                    return Err(Error::runtime("debug invalid; expected a boolean"));
+                };
+
+                let (targets, with_jumps) = from
+                    .targets_with(this.project, this.symbols, true)
+                    .map_err(Error::external)?;
+
+                let functions = this.project.functions();
+                let blocks = this.project.code_blocks();
+                let icfg = this.project.icfg();
+
+                let table = lua.create_table()?;
+                let mut index = 1usize;
+
+                let using = using.unwrap_or_default();
+                for from in targets {
+                    let resolver = AnnotatingPlatformTypeResolver::new_with(
+                        T::type_resolver(this.project),
+                        &this.project,
+                        Cow::Owned(using.clone()),
+                        Some(&*this.symbols),
+                        Some(&*this.types.types()),
+                    );
+
+                    let aliases =
+                        TypedAliases::analyse_function_with(&*this.project, from, &resolver);
+
+                    let debug =
+                        debug.then(|| aliases.display_with(this.project).to_string());
+
+                    for blk in from.blocks_with(blocks) {
+                        for edge in icfg.edges_directed(blk.node(), Direction::Outgoing) {
+                            if !(edge.weight().is_call()
+                                || (with_jumps && edge.weight().is_branch()))
+                            {
+                                continue;
+                            }
+
+                            let callee_blk = &blocks[icfg[edge.target()]];
+                            let callee_fid = callee_blk.function();
+                            let callee_f = &functions[callee_fid];
+
+                            let callee_fctx = unsafe {
+                                mem::transmute::<_, FunctionContext<'static>>(
+                                    FunctionContext::new_with(
+                                        callee_f,
+                                        this.project,
+                                        this.symbols,
+                                    ),
+                                )
+                            };
+
+                            if matches!(where_.as_ref(), Some(f) if !f.call::<bool>(callee_fctx.clone())?)
+                            {
+                                continue;
+                            }
+
+                            let aliases = &aliases.blocks()[&blk.id()];
+                            let fcctx = CallSiteContext::new(
+                                this.project,
+                                from,
+                                blk,
+                                aliases,
+                                this.symbols,
+                                this.types.types(),
+                            );
+
+                            let inputs = fcctx
+                                .inputs()
+                                .into_iter()
+                                .map(|opnd| opnd.to_table(lua))
+                                .collect::<Result<Vec<Table>, _>>()?;
+
+                            let output = fcctx.output().to_table(lua)?;
+
+                            let operands = lua.create_table()?;
+
+                            operands.raw_set(
+                                "call_address",
+                                lua.create_ser_userdata(AddressValue::from(blk.last_address()))?,
+                            )?;
+                            operands.raw_set(
+                                "name",
+                                this.symbols
+                                    .function_mapping()
+                                    .get(&callee_fid)
+                                    .copied()
+                                    .or_else(|| callee_f.name())
+                                    .map(|v| v.as_str()),
+                            )?;
+                            operands.raw_set(
+                                "callee_address",
+                                lua.create_ser_userdata(AddressValue::from(callee_f.address()))?,
+                            )?;
+                            operands.raw_set("callee", callee_fctx.clone())?;
+                            operands.raw_set("inputs", inputs)?;
+                            operands.raw_set("output", output)?;
+
+                            if let Some(debug) = debug.as_ref() {
+                                operands.raw_set("debug", lua.create_string(debug)?)?;
+                            }
+
+                            table.raw_set(index, operands)?;
+                            index += 1;
+                        }
+                    }
+                }
+
+                Ok(Value::Table(table))
+            },
+        );
+
+        methods.add_method(
+            "callee_at",
+            |lua, this, cond: Table| -> Result<Value, Error> {
+                // target -> CallSiteQuery
+                // debug -> produce debug string (optional)
+
+                let Ok(target) = cond
+                    .get::<Value>("target")
+                    .and_then(|value| lua.from_value::<CallSiteQuery>(value))
+                else {
+                    return Err(Error::runtime(
+                        "target missing or invalid; expected address",
+                    ));
+                };
+
+                let Ok(debug) = cond
+                    .get::<Option<bool>>("debug")
+                    .map(Option::unwrap_or_default)
+                else {
+                    return Err(Error::runtime("debug invalid; expected a boolean"));
+                };
+
+                let (addr, with_jumps) = target.targets();
+
+                let functions = this.project.functions();
+                let blocks = this.project.code_blocks();
+                let icfg = this.project.icfg();
+
+                // As non-exact location of the call site can be provided
+                // (e.g. when the address comes from decompiled-source mapping)
+                // we search for the block that contains it.
+                let Some(blk) = this
+                    .project
+                    .get_analysis::<CodeBlockBounds>()
+                    .get(addr)
+                    .map(|(_, &bid)| &blocks[bid])
+                else {
+                    return Ok(Value::Nil);
+                };
+
+                for edge in icfg.edges_directed(blk.node(), Direction::Outgoing) {
+                    if !(edge.weight().is_call() || (with_jumps && edge.weight().is_branch())) {
+                        continue;
+                    }
+
+                    let from = &functions[blk.function()];
+
+                    let callee_fid = blocks[icfg[edge.target()]].function();
+                    let callee_f = &functions[callee_fid];
+
+                    let callee_fctx =
+                        unsafe {
+                            mem::transmute::<_, FunctionContext<'static>>(
+                                FunctionContext::new_with(callee_f, this.project, this.symbols),
+                            )
+                        };
+
+                    let resolver = AnnotatingPlatformTypeResolver::new_with(
+                        T::type_resolver(this.project),
+                        &this.project,
+                        Cow::Owned(CheckScopeCallsAnnotations::default()),
+                        Some(&*this.symbols),
+                        Some(&*this.types.types()),
+                    );
+
+                    let aliases =
+                        TypedAliases::analyse_function_with(&*this.project, from, &resolver);
+
+                    let debug = debug.then(|| aliases.display_with(this.project).to_string());
+
+                    let aliases = &aliases.blocks()[&blk.id()];
+
+                    let fcctx = CallSiteContext::new(
+                        this.project,
+                        from,
+                        blk,
+                        aliases,
+                        this.symbols,
+                        this.types.types(),
+                    );
+
+                    let inputs = fcctx
+                        .inputs()
+                        .into_iter()
+                        .map(|opnd| opnd.to_table(lua))
+                        .collect::<Result<Vec<Table>, _>>()?;
+
+                    let output = fcctx.output().to_table(lua)?;
+
+                    let operands = lua.create_table()?;
+
+                    operands.raw_set(
+                        "name",
+                        this.symbols
+                            .function_mapping()
+                            .get(&callee_fid)
+                            .copied()
+                            .or_else(|| callee_f.name())
+                            .map(|v| v.as_str()),
+                    )?;
+                    operands.raw_set(
+                        "callee_address",
+                        lua.create_ser_userdata(AddressValue::from(callee_f.address()))?,
+                    )?;
+                    operands.raw_set("callee", callee_fctx)?;
+                    operands.raw_set("inputs", inputs)?;
+                    operands.raw_set("output", output)?;
+
+                    if let Some(debug) = debug.as_ref() {
+                        operands.raw_set("debug", lua.create_string(debug)?)?;
+                    }
+
+                    return Ok(Value::Table(operands));
+                }
+
+                Ok(Value::Nil)
+            },
+        );
+
+        methods.add_method(
             "search_bytes",
             |_, this, value: String| -> Result<bool, Error> {
                 let matcher = BMatcher::from_str(&value).map_err(Error::external)?;
@@ -753,6 +1018,75 @@ where
                     searcher.matches_rule(&mut context, this.project())
                 };
                 Ok(result)
+            },
+        );
+
+        methods.add_method(
+            "find_bytes",
+            |lua, this, value: String| -> Result<Table, Error> {
+                let table = lua.create_table()?;
+
+                if value.is_empty() {
+                    return Ok(table);
+                }
+
+                let matcher = BMatcher::from_str(&value).map_err(Error::external)?;
+                let mut index = 1usize;
+                for (_, region) in this.project().memory().regions().iter(..) {
+                    let bytes = region.bytes();
+                    let base = *region.address();
+                    let mut offset = 0usize;
+                    while let Some(found) = matcher.position_from(bytes, offset) {
+                        let addr = base + found;
+                        table.raw_set(index, lua.create_ser_userdata(AddressValue::from(addr))?)?;
+                        index += 1;
+                        offset = found + 1;
+                    }
+                }
+
+                Ok(table)
+            },
+        );
+
+        methods.add_method(
+            "find_string",
+            |lua, this, value: (String, Variadic<String>)| -> Result<Table, Error> {
+                let needle = if let Some(kind) = value.1.first() {
+                    let kind = match &**kind {
+                        "ascii" => StringData::Ascii,
+                        "utf8" => StringData::Utf8,
+                        "utf16" | "utf16-le" | "utf16le" => StringData::Utf16Le,
+                        "utf16-be" | "utf16be" => StringData::Utf16Be,
+                        enc => {
+                            return Err(Error::external(format!("invalid string encoding `{enc}`")))
+                        }
+                    };
+                    kind.encode(value.0).map_err(Error::external)?
+                } else {
+                    value.0.into_bytes()
+                };
+
+                let table = lua.create_table()?;
+
+                if needle.is_empty() {
+                    return Ok(table);
+                }
+
+                let matcher = BMatcher::from(needle);
+                let mut index = 1usize;
+                for (_, region) in this.project().memory().regions().iter(..) {
+                    let bytes = region.bytes();
+                    let base = *region.address();
+                    let mut offset = 0usize;
+                    while let Some(found) = matcher.position_from(bytes, offset) {
+                        let addr = base + found;
+                        table.raw_set(index, lua.create_ser_userdata(AddressValue::from(addr))?)?;
+                        index += 1;
+                        offset = found + 1;
+                    }
+                }
+
+                Ok(table)
             },
         );
 
